@@ -1,0 +1,47 @@
+{
+  "songs": [
+    {
+      "id": 0,
+      "title": "test",
+      "artist": "test",
+      "genre": "test",
+      "play_count": 0
+    },
+    {
+      "id": 1,
+      "title": "test",
+      "artist": "test",
+      "genre": "test",
+      "play_count": 0
+    },
+    {
+      "id": 2,
+      "title": "test",
+      "artist": "test",
+      "genre": "test",
+      "play_count": 0
+    },
+    {
+      "id": 3,
+      "title": "Bohemian Rhapsody",
+      "artist": "Queen",
+      "genre": "Rock",
+      "play_count": 0
+    },
+    {
+      "id": 4,
+      "title": "Love Story",
+      "artist": "Taylor Swift",
+      "genre": "Country",
+      "play_count": 0
+    },
+    {
+      "id": 5,
+      "title": "Welcome to New York",
+      "artist": "Taylor Swift",
+      "genre": "Pop",
+      "play_count": 0
+    }
+  ],
+  "next_id": 6
+}
