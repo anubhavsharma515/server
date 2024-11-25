@@ -4,16 +4,15 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-
-// Arc is a thread-safe pointer to shared data.
-// It provides shared ownership to something on heap.
-// Mutex is for protecting shared data
+use num_cpus;
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Read,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use tokio::task;
 
 // Define the Song struct with serialization and deserialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -25,6 +24,8 @@ struct Song {
     play_count: usize,
 }
 
+// This is the JSON response that will be returned when a song is
+// added to the catalog
 #[derive(Debug, Deserialize)]
 struct NewSong {
     title: String,
@@ -32,6 +33,8 @@ struct NewSong {
     genre: String,
 }
 
+// These are the valid params that can be passed to search from
+// songs within the catalog
 #[derive(Debug, Deserialize)]
 struct QueryParams {
     title: Option<String>,
@@ -40,18 +43,55 @@ struct QueryParams {
 }
 
 // State to be shared across the requesting threads
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct AppState {
-    songs: Vec<Song>,
+    songs: HashMap<usize, Song>,  // Change Vec to HashMap
     next_id: usize,
 }
 
-#[tokio::main]
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            songs: HashMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+const FILE_PATH: &str = "songs.json";
+
+// The background task that saves state to the file asynchronously
+async fn save_state_to_file_async(state: AppState) {
+    let content = match serde_json::to_string_pretty(&state) {
+        Ok(json) => json,
+        Err(_) => {
+            eprintln!("Error serializing state. Changes will not be saved.");
+            return;
+        }
+    };
+
+    // Write to the file asynchronously without blocking the main thread
+    if let Err(_) = tokio::fs::write(FILE_PATH, content).await {
+        eprintln!("Error writing state to file.");
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
-    // Create a shared counter with Arc and Mutex
     let state = Arc::new(Mutex::new(load_state_from_file("songs.json")));
 
-    // Create the app with the count route
+    // Define the address
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+    let server = axum::Server::try_bind(&addr).unwrap_or_else(|err| {
+        eprintln!("Failed to bind to {}: {}", addr, err);
+        std::process::exit(1);
+    });
+
+    // Print the message only after the server successfully binds
+    println!("Server is running at http://{}", addr);
+
+    // Create the app
     let app = Router::new()
         .route("/", get(|| async { "Welcome to the web server!" }))
         .route("/songs/new", post(add_new_song))
@@ -59,38 +99,35 @@ async fn main() {
         .route("/songs/search", get(search_song))
         .with_state(state.clone()); // Share the state
 
-    // Define the address
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    println!("Server is running at http://{}", addr);
-
     // Start the server
-    axum::Server::bind(&addr)
+    server 
         .serve(app.into_make_service())
         .await
         .unwrap();
-
-    save_state_to_file(&state.lock().unwrap(), "songs.json");
 }
 
 async fn add_new_song(
     State(state): State<Arc<Mutex<AppState>>>,
     Json(payload): Json<NewSong>,
 ) -> Json<Song> {
-    // Lock the state and add the new song
+    // Lock the state only for inserting the new song
     let mut state = state.lock().unwrap();
 
+    // Add the new song
     let new_song = Song {
         id: state.next_id,
-        title: payload.title,
-        artist: payload.artist,
-        genre: payload.genre,
+        title: payload.title.clone(),
+        artist: payload.artist.clone(),
+        genre: payload.genre.clone(),
         play_count: 0,
     };
 
-    state.songs.push(new_song.clone());
+    state.songs.insert(new_song.id, new_song.clone()); // Insert into HashMap
     state.next_id += 1; // Increment the ID counter
 
-    save_state_to_file(&state, "songs.json");
+    // Offload the file save task to a background task
+    let state_clone = state.clone();
+    // tokio::spawn(save_state_to_file_async(state_clone));
 
     // Return the newly added song as JSON
     Json(new_song)
@@ -98,13 +135,13 @@ async fn add_new_song(
 
 async fn search_song(
     State(state): State<Arc<Mutex<AppState>>>,
-    Query(params): Query<QueryParams>, // Extract search query parameters
+    Query(params): Query<QueryParams>,
 ) -> Json<Vec<Song>> {
     let state = state.lock().unwrap();
 
     let results: Vec<Song> = state
         .songs
-        .iter()
+        .values()
         .filter(|song| {
             params.title.as_ref().map_or(true, |t| {
                 song.title.to_lowercase().contains(&t.to_lowercase())
@@ -122,19 +159,27 @@ async fn search_song(
 
 async fn play_song(
     State(state): State<Arc<Mutex<AppState>>>,
-    Path(id): Path<usize>
+    Path(id): Path<usize>,
 ) -> Json<serde_json::Value> {
+    let updated_song = {
+        let mut state = state.lock().unwrap(); // Lock the state to modify it
 
-    let mut state = state.lock().unwrap();
+        if let Some(song) = state.songs.get_mut(&id) { // Use `get_mut` for HashMap
+            song.play_count += 1; // Increment play count
+            Some(song.clone()) // Clone the updated song for saving and returning
+        } else {
+            return Json(serde_json::json!({ "error": "Song not found" })); // Handle song not found
+        }
+    }; // The `MutexGuard` is dropped here
 
-    if let Some(song) = state.songs.iter_mut().find(|s| s.id == id) {
-        song.play_count += 1;
-        Json(serde_json::json!(song))
-    } else {
-        Json(serde_json::json!({ "error": "Song not found" }))
+    // Offload the file save task to a background task
+    {
+        let state = state.lock().unwrap();
+        tokio::spawn(save_state_to_file_async(state.clone()));
     }
-}
 
+    Json(serde_json::json!(updated_song.unwrap()))
+}
 
 fn load_state_from_file(file_path: &str) -> AppState {
     let mut file = match OpenOptions::new().read(true).open(file_path) {
@@ -151,23 +196,8 @@ fn load_state_from_file(file_path: &str) -> AppState {
     match serde_json::from_str(&content) {
         Ok(state) => state,
         Err(_) => {
-            eprintln!("Error parsing state file. Starting with default state.");
+            eprintln!("Error deserializing state file. Starting with default state.");
             AppState::default()
         }
-    }
-}
-
-// Function to save the state to a JSON file
-fn save_state_to_file(state: &AppState, file_path: &str) {
-    let content = match serde_json::to_string_pretty(state) {
-        Ok(json) => json,
-        Err(_) => {
-            eprintln!("Error serializing state. Changes will not be saved.");
-            return;
-        }
-    };
-
-    if let Err(_) = fs::write(file_path, content) {
-        eprintln!("Error writing state to file.");
     }
 }
