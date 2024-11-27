@@ -1,18 +1,16 @@
+use kv::{Bucket, Config, Store, Codec};
 use axum::{
     extract::{Json, Path, Query, State},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
-use num_cpus;
 use std::{
-    collections::HashMap,
-    fs::{self, OpenOptions},
-    io::Read,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
-use tokio::task;
+
+use tokio::{runtime::Builder, sync::Mutex};
 
 // Define the Song struct with serialization and deserialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -43,161 +41,177 @@ struct QueryParams {
 }
 
 // State to be shared across the requesting threads
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AppState {
-    songs: HashMap<usize, Song>,  // Change Vec to HashMap
-    next_id: usize,
+// State should be sharing context of a database to read/write
+#[derive(Clone)]
+struct AppState<'a> {
+    store: Bucket<'a, kv::Integer, kv::Json<Song>>,
+    visit_count: Arc<Mutex<usize>>,
+    refresh: Arc<Mutex<bool>>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        AppState {
-            songs: HashMap::new(),
-            next_id: 1,
-        }
-    }
-}
-
-const FILE_PATH: &str = "songs.json";
-
-// The background task that saves state to the file asynchronously
-async fn save_state_to_file_async(state: AppState) {
-    let content = match serde_json::to_string_pretty(&state) {
-        Ok(json) => json,
-        Err(_) => {
-            eprintln!("Error serializing state. Changes will not be saved.");
-            return;
-        }
-    };
-
-    // Write to the file asynchronously without blocking the main thread
-    if let Err(_) = tokio::fs::write(FILE_PATH, content).await {
-        eprintln!("Error writing state to file.");
-    }
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::main]
 async fn main() {
-    let state = Arc::new(Mutex::new(load_state_from_file("songs.json")));
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(8) // specify the number of threads you want
+        .build()
+        .unwrap();
+
+    let cfg = Config::new("server_db"); // new data store that writes to disk
+    let db = Store::new(cfg).unwrap(); // store can be thought of as the DB
+    // Key-val store, where key is an int and val is of type Json<Song>
+    // bucket can be thought of as a table
+    let store = db.bucket::<kv::Integer, kv::Json<Song>>(Some("songs")).unwrap();
+
+    let visit_count = Arc::new(Mutex::new(0));
+    let refresh = Arc::new(Mutex::new(false));
+    let state = AppState { store, visit_count, refresh };
+
+    // Spawn a background task for syncing the store when marked dirty
+    let refresh_clone = state.refresh.clone();
+    let store_clone = state.store.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let mut sync = false;
+            {
+                let mut should_refresh = refresh_clone.lock().await;
+                if *should_refresh && store_clone.len() > 1000 {
+                    sync = true;
+                    *should_refresh = false;
+                }
+            }
+
+            if sync {
+                store_clone.flush_async().await.unwrap();
+            }
+        }
+    });
 
     // Define the address
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
 
-    let server = axum::Server::try_bind(&addr).unwrap_or_else(|err| {
-        eprintln!("Failed to bind to {}: {}", addr, err);
-        std::process::exit(1);
-    });
+    // Define the app with routes and shared state
+    let app = Router::new()
+        .route("/", get(|| async { "Welcome to the web server!" }))
+        .route("/count", get(handle_count))
+        .route("/songs/new", post(add_new_song))
+        .route("/songs/play/:id", get(play_song))
+        .route("/songs/search", get(search_song))
+        .with_state(state);
 
     // Print the message only after the server successfully binds
     println!("Server is running at http://{}", addr);
 
-    // Create the app
-    let app = Router::new()
-        .route("/", get(|| async { "Welcome to the web server!" }))
-        .route("/songs/new", post(add_new_song))
-        .route("/songs/play/:id", get(play_song))
-        .route("/songs/search", get(search_song))
-        .with_state(state.clone()); // Share the state
-
     // Start the server
-    server 
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    runtime.spawn(async move {
+        axum::Server::bind(&addr)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    }).await.unwrap();
 }
 
+async fn handle_count(State(state): State<AppState<'_>>) -> String {
+
+    let mut vc = state.visit_count.lock().await;
+    *vc += 1;
+    format!("Visit count: {}", *vc)
+}
+
+// Handler to add a new song
 async fn add_new_song(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<AppState<'_>>,
     Json(payload): Json<NewSong>,
 ) -> Json<Song> {
-    // Lock the state only for inserting the new song
-    let mut state = state.lock().unwrap();
+    let store = &state.store;
 
-    // Add the new song
-    let new_song = Song {
-        id: state.next_id,
-        title: payload.title.clone(),
-        artist: payload.artist.clone(),
-        genre: payload.genre.clone(),
+    // Generate an ID for the new song
+    let id = store.len() + 1;
+    let song = Song {
+        id,
+        title: payload.title,
+        artist: payload.artist,
+        genre: payload.genre,
         play_count: 0,
     };
 
-    state.songs.insert(new_song.id, new_song.clone()); // Insert into HashMap
-    state.next_id += 1; // Increment the ID counter
+    // Add the new song to the store
+    store
+        .set(&kv::Integer::from(id), &kv::Json(song.clone()))
+        .unwrap();
 
-    // Offload the file save task to a background task
-    let state_clone = state.clone();
-    // tokio::spawn(save_state_to_file_async(state_clone));
+    // Mark the store as dirty
+    let mut refresh = state.refresh.lock().await;
+    *refresh = true;
 
-    // Return the newly added song as JSON
-    Json(new_song)
+    Json(song)
 }
 
+// Handler to search songs based on query parameters
 async fn search_song(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<AppState<'_>>,
     Query(params): Query<QueryParams>,
 ) -> Json<Vec<Song>> {
-    let state = state.lock().unwrap();
+    let store = &state.store;
 
-    let results: Vec<Song> = state
-        .songs
-        .values()
-        .filter(|song| {
-            params.title.as_ref().map_or(true, |t| {
-                song.title.to_lowercase().contains(&t.to_lowercase())
-            }) && params.artist.as_ref().map_or(true, |a| {
-                song.artist.to_lowercase().contains(&a.to_lowercase())
-            }) && params.genre.as_ref().map_or(true, |g| {
-                song.genre.to_lowercase().contains(&g.to_lowercase())
-            })
+    // Collect matching songs
+    let results = store
+        .iter()
+        .filter_map(|item| {
+            let song = match item {
+                Ok(item) => match item.value::<kv::Json<Song>>() {
+                    Ok(song) => song.into_inner(),
+                    Err(_) => return None,
+                },
+                Err(_) => return None,
+            };
+
+            // Check if the song matches the query
+            if let Some(title) = &params.title {
+                if !song.title.to_lowercase().contains(&title.to_lowercase()) {
+                    return None;
+                }
+            }
+            if let Some(artist) = &params.artist {
+                if !song.artist.to_lowercase().contains(&artist.to_lowercase()) {
+                    return None;
+                }
+            }
+            if let Some(genre) = &params.genre {
+                if !song.genre.to_lowercase().contains(&genre.to_lowercase()) {
+                    return None;
+                }
+            }
+            Some(song)
         })
-        .cloned()
         .collect();
 
     Json(results)
 }
 
+// Handler to play a song by ID
 async fn play_song(
-    State(state): State<Arc<Mutex<AppState>>>,
+    State(state): State<AppState<'_>>,
     Path(id): Path<usize>,
 ) -> Json<serde_json::Value> {
-    let updated_song = {
-        let mut state = state.lock().unwrap(); // Lock the state to modify it
+    let store = &state.store;
+    let key = kv::Integer::from(id);
 
-        if let Some(song) = state.songs.get_mut(&id) { // Use `get_mut` for HashMap
-            song.play_count += 1; // Increment play count
-            Some(song.clone()) // Clone the updated song for saving and returning
-        } else {
-            return Json(serde_json::json!({ "error": "Song not found" })); // Handle song not found
+    // Find and update the song's play count
+    let updated_song = match store.get(&key).unwrap() {
+        Some(value) => {
+            let mut song: Song = value.into_inner();
+            song.play_count += 1;
+
+            // Update the store
+            store.set(&key, &kv::Json(song.clone())).unwrap();
+            Some(song)
         }
-    }; // The `MutexGuard` is dropped here
-
-    // Offload the file save task to a background task
-    {
-        let state = state.lock().unwrap();
-        tokio::spawn(save_state_to_file_async(state.clone()));
-    }
-
-    Json(serde_json::json!(updated_song.unwrap()))
-}
-
-fn load_state_from_file(file_path: &str) -> AppState {
-    let mut file = match OpenOptions::new().read(true).open(file_path) {
-        Ok(file) => file,
-        Err(_) => return AppState::default(), // Return default state if the file doesn't exist
+        None => None,
     };
 
-    let mut content = String::new();
-    if let Err(_) = file.read_to_string(&mut content) {
-        eprintln!("Error reading state file. Starting with default state.");
-        return AppState::default();
-    }
-
-    match serde_json::from_str(&content) {
-        Ok(state) => state,
-        Err(_) => {
-            eprintln!("Error deserializing state file. Starting with default state.");
-            AppState::default()
-        }
+    match updated_song {
+        Some(song) => Json(serde_json::json!(song)),
+        None => Json(serde_json::json!({ "error": "Song not found" })),
     }
 }
