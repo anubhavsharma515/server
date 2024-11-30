@@ -1,4 +1,3 @@
-use kv::{Bucket, Config, Store, Codec};
 use axum::{
     extract::{Json, Path, Query, State},
     routing::{get, post},
@@ -7,19 +6,21 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU32, Ordering}}
 };
 
-use tokio::{runtime::Builder, sync::Mutex};
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool, sqlite::SqlitePoolOptions, QueryBuilder};
+
+const DB_URL: &str = "sqlite://songs.db";
 
 // Define the Song struct with serialization and deserialization
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, Clone)]
 struct Song {
-    id: usize,
+    id: i32,
     title: String,
     artist: String,
     genre: String,
-    play_count: usize,
+    play_count: i32,
 }
 
 // This is the JSON response that will be returned when a song is
@@ -43,49 +44,50 @@ struct QueryParams {
 // State to be shared across the requesting threads
 // State should be sharing context of a database to read/write
 #[derive(Clone)]
-struct AppState<'a> {
-    store: Bucket<'a, kv::Integer, kv::Json<Song>>,
-    visit_count: Arc<Mutex<usize>>,
-    refresh: Arc<Mutex<bool>>,
+struct AppState {
+    db: SqlitePool,
+    visit_count: Arc<AtomicU32>,
 }
 
 #[tokio::main]
 async fn main() {
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(8) // specify the number of threads you want
-        .build()
+
+    if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
+            println!("Creating database {}", DB_URL);
+            match Sqlite::create_database(DB_URL).await {
+                Ok(_) => println!("Create db success"),
+                Err(error) => panic!("error: {}", error),
+            }
+        } else {
+            println!("Database already exists");
+        }
+
+    let visit_count = Arc::new(AtomicU32::new(0));
+
+    let db = SqlitePoolOptions::new()
+        .min_connections(15)
+        .max_connections(20)
+        .connect(DB_URL)
+        .await
         .unwrap();
 
-    let cfg = Config::new("server_db"); // new data store that writes to disk
-    let db = Store::new(cfg).unwrap(); // store can be thought of as the DB
-    // Key-val store, where key is an int and val is of type Json<Song>
-    // bucket can be thought of as a table
-    let store = db.bucket::<kv::Integer, kv::Json<Song>>(Some("songs")).unwrap();
 
-    let visit_count = Arc::new(Mutex::new(0));
-    let refresh = Arc::new(Mutex::new(false));
-    let state = AppState { store, visit_count, refresh };
+    sqlx::query("
+        CREATE TABLE IF NOT EXISTS songs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title_lowercase  VARCHAR(250) NOT NULL,
+            genre_lowercase  VARCHAR(250) NOT NULL,
+            artist_lowercase VARCHAR(250) NOT NULL,
+            title VARCHAR(250) NOT NULL,
+            genre VARCHAR(250) NOT NULL,
+            artist VARCHAR(250) NOT NULL,
+            play_count INTEGER DEFAULT 0
+        );")
+        .execute(&db)
+        .await
+        .unwrap();
 
-    // Spawn a background task for syncing the store when marked dirty
-    let refresh_clone = state.refresh.clone();
-    let store_clone = state.store.clone();
-
-    tokio::spawn(async move {
-        loop {
-            let mut sync = false;
-            {
-                let mut should_refresh = refresh_clone.lock().await;
-                if *should_refresh && store_clone.len() > 1000 {
-                    sync = true;
-                    *should_refresh = false;
-                }
-            }
-
-            if sync {
-                store_clone.flush_async().await.unwrap();
-            }
-        }
-    });
+    let state = AppState { db, visit_count };
 
     // Define the address
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -103,115 +105,130 @@ async fn main() {
     println!("Server is running at http://{}", addr);
 
     // Start the server
-    runtime.spawn(async move {
-        axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await
-            .unwrap();
-    }).await.unwrap();
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
-async fn handle_count(State(state): State<AppState<'_>>) -> String {
+async fn handle_count(State(state): State<AppState>) -> String {
 
-    let mut vc = state.visit_count.lock().await;
-    *vc += 1;
-    format!("Visit count: {}", *vc)
+    let mut count = state.visit_count.fetch_add(1, Ordering::Relaxed) + 1;
+    count += 1;
+    format!("Visit count: {}", count)
 }
 
 // Handler to add a new song
 async fn add_new_song(
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState>,
     Json(payload): Json<NewSong>,
 ) -> Json<Song> {
-    let store = &state.store;
+    // Insert the new song into the database
 
-    // Generate an ID for the new song
-    let id = store.len() + 1;
-    let song = Song {
-        id,
-        title: payload.title,
-        artist: payload.artist,
-        genre: payload.genre,
-        play_count: 0,
-    };
+    let result = sqlx::query("
+        INSERT INTO songs (title_lowercase, artist_lowercase, genre_lowercase, title, artist, genre, play_count)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    ")
+    .bind(&payload.title.to_lowercase())
+    .bind(&payload.artist.to_lowercase())
+    .bind(&payload.genre.to_lowercase())
+    .bind(&payload.title)
+    .bind(&payload.artist)
+    .bind(&payload.genre)
+    .execute(&state.db)
+    .await
+    .unwrap();
 
-    // Add the new song to the store
-    store
-        .set(&kv::Integer::from(id), &kv::Json(song.clone()))
-        .unwrap();
+    let song_id = result.last_insert_rowid() as i32;
 
-    // Mark the store as dirty
-    let mut refresh = state.refresh.lock().await;
-    *refresh = true;
-
-    Json(song)
+    Json(
+        Song {
+            id: song_id,
+            title: payload.title,
+            artist: payload.artist,
+            genre: payload.genre,
+            play_count: 0,
+        }
+    )
 }
+
 
 // Handler to search songs based on query parameters
 async fn search_song(
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState>,
     Query(params): Query<QueryParams>,
 ) -> Json<Vec<Song>> {
-    let store = &state.store;
+    let db = &state.db;
 
-    // Collect matching songs
-    let results = store
-        .iter()
-        .filter_map(|item| {
-            let song = match item {
-                Ok(item) => match item.value::<kv::Json<Song>>() {
-                    Ok(song) => song.into_inner(),
-                    Err(_) => return None,
-                },
-                Err(_) => return None,
-            };
+    // Start building the query
+    let mut query_builder = QueryBuilder::<Sqlite>::new("SELECT * FROM songs WHERE 1=1");
 
-            // Check if the song matches the query
-            if let Some(title) = &params.title {
-                if !song.title.to_lowercase().contains(&title.to_lowercase()) {
-                    return None;
-                }
-            }
-            if let Some(artist) = &params.artist {
-                if !song.artist.to_lowercase().contains(&artist.to_lowercase()) {
-                    return None;
-                }
-            }
-            if let Some(genre) = &params.genre {
-                if !song.genre.to_lowercase().contains(&genre.to_lowercase()) {
-                    return None;
-                }
-            }
-            Some(song)
-        })
-        .collect();
+    // Dynamically add conditions based on query params
+    if let Some(title) = &params.title {
+        query_builder.push(" AND title_lowercase LIKE ").push_bind(format!("%{}%", title.to_lowercase()));
+    }
+    if let Some(artist) = &params.artist {
+        query_builder.push(" AND artist_lowercase LIKE ").push_bind(format!("%{}%", artist.to_lowercase()));
+    }
+    if let Some(genre) = &params.genre {
+        query_builder.push(" AND genre_lowercase LIKE ").push_bind(format!("%{}%", genre.to_lowercase()));
+    }
 
-    Json(results)
+    // Execute the query and fetch results
+    let songs: Vec<Song> = query_builder
+        .build_query_as::<Song>() // Map rows to the Song struct
+        .fetch_all(db)
+        .await
+        .unwrap_or_else(|_| Vec::new()); // Handle errors gracefully by returning an empty list
+
+    // Return the results as a JSON response
+    Json(songs)
 }
 
-// Handler to play a song by ID
+// // Handler to play a song by ID
 async fn play_song(
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState>,
     Path(id): Path<usize>,
 ) -> Json<serde_json::Value> {
-    let store = &state.store;
-    let key = kv::Integer::from(id);
+    let db = &state.db;
 
-    // Find and update the song's play count
-    let updated_song = match store.get(&key).unwrap() {
-        Some(value) => {
-            let mut song: Song = value.into_inner();
-            song.play_count += 1;
+    // Increment the play_count for the song with the given ID
+    let rows_affected = sqlx::query(
+        "
+        UPDATE songs
+        SET play_count = play_count + 1
+        WHERE id = ?
+        "
+    )
+    .bind(id as i32) // Binding the ID
+    .execute(db) // Execute the query
+    .await
+    .unwrap()
+    .rows_affected();
 
-            // Update the store
-            store.set(&key, &kv::Json(song.clone())).unwrap();
-            Some(song)
-        }
-        None => None,
-    };
-
-    match updated_song {
-        Some(song) => Json(serde_json::json!(song)),
-        None => Json(serde_json::json!({ "error": "Song not found" })),
+    // Check if the song exists
+    if rows_affected == 0 {
+        return Json(serde_json::json!({"error": "Song not found"}));
     }
+
+    // Fetch the updated song details
+    let song: (i32, String, String, String, i32) = sqlx::query_as("
+        SELECT id, title, artist, genre, play_count
+        FROM songs
+        WHERE id = ?
+    "
+    )
+    .bind(id as i32)
+    .fetch_one(db) // Fetch the single row
+    .await
+    .unwrap();
+
+    // Return the updated song as a JSON response
+    Json(serde_json::json!(Song {
+        id: song.0,
+        title: song.1,
+        genre: song.2,
+        artist: song.3,
+        play_count: song.4
+    }))
 }
