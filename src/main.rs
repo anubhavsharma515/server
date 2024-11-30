@@ -6,10 +6,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    sync::{Arc, atomic::{AtomicU32, Ordering}}
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool, sqlite::SqlitePoolOptions, QueryBuilder};
+use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, QueryBuilder, Sqlite, SqlitePool};
 
 const DB_URL: &str = "sqlite://songs.db";
 
@@ -51,16 +54,15 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-
     if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
-            println!("Creating database {}", DB_URL);
-            match Sqlite::create_database(DB_URL).await {
-                Ok(_) => println!("Create db success"),
-                Err(error) => panic!("error: {}", error),
-            }
-        } else {
-            println!("Database already exists");
+        println!("Creating database {}", DB_URL);
+        match Sqlite::create_database(DB_URL).await {
+            Ok(_) => println!("Create db success"),
+            Err(error) => panic!("error: {}", error),
         }
+    } else {
+        println!("Database already exists");
+    }
 
     let visit_count = Arc::new(AtomicU32::new(0));
 
@@ -71,8 +73,8 @@ async fn main() {
         .await
         .unwrap();
 
-
-    sqlx::query("
+    sqlx::query(
+        "
         CREATE TABLE IF NOT EXISTS songs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title_lowercase  VARCHAR(250) NOT NULL,
@@ -82,10 +84,11 @@ async fn main() {
             genre VARCHAR(250) NOT NULL,
             artist VARCHAR(250) NOT NULL,
             play_count INTEGER DEFAULT 0
-        );")
-        .execute(&db)
-        .await
-        .unwrap();
+        );",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
 
     let state = AppState { db, visit_count };
 
@@ -112,17 +115,13 @@ async fn main() {
 }
 
 async fn handle_count(State(state): State<AppState>) -> String {
-
     let mut count = state.visit_count.fetch_add(1, Ordering::Relaxed) + 1;
     count += 1;
     format!("Visit count: {}", count)
 }
 
 // Handler to add a new song
-async fn add_new_song(
-    State(state): State<AppState>,
-    Json(payload): Json<NewSong>,
-) -> Json<Song> {
+async fn add_new_song(State(state): State<AppState>, Json(payload): Json<NewSong>) -> Json<Song> {
     // Insert the new song into the database
 
     let result = sqlx::query("
@@ -141,17 +140,14 @@ async fn add_new_song(
 
     let song_id = result.last_insert_rowid() as i32;
 
-    Json(
-        Song {
-            id: song_id,
-            title: payload.title,
-            artist: payload.artist,
-            genre: payload.genre,
-            play_count: 0,
-        }
-    )
+    Json(Song {
+        id: song_id,
+        title: payload.title,
+        artist: payload.artist,
+        genre: payload.genre,
+        play_count: 0,
+    })
 }
-
 
 // Handler to search songs based on query parameters
 async fn search_song(
@@ -165,13 +161,19 @@ async fn search_song(
 
     // Dynamically add conditions based on query params
     if let Some(title) = &params.title {
-        query_builder.push(" AND title_lowercase LIKE ").push_bind(format!("%{}%", title.to_lowercase()));
+        query_builder
+            .push(" AND title_lowercase LIKE ")
+            .push_bind(format!("%{}%", title.to_lowercase()));
     }
     if let Some(artist) = &params.artist {
-        query_builder.push(" AND artist_lowercase LIKE ").push_bind(format!("%{}%", artist.to_lowercase()));
+        query_builder
+            .push(" AND artist_lowercase LIKE ")
+            .push_bind(format!("%{}%", artist.to_lowercase()));
     }
     if let Some(genre) = &params.genre {
-        query_builder.push(" AND genre_lowercase LIKE ").push_bind(format!("%{}%", genre.to_lowercase()));
+        query_builder
+            .push(" AND genre_lowercase LIKE ")
+            .push_bind(format!("%{}%", genre.to_lowercase()));
     }
 
     // Execute the query and fetch results
@@ -198,7 +200,7 @@ async fn play_song(
         UPDATE songs
         SET play_count = play_count + 1
         WHERE id = ?
-        "
+        ",
     )
     .bind(id as i32) // Binding the ID
     .execute(db) // Execute the query
@@ -212,11 +214,12 @@ async fn play_song(
     }
 
     // Fetch the updated song details
-    let song: (i32, String, String, String, i32) = sqlx::query_as("
+    let song: (i32, String, String, String, i32) = sqlx::query_as(
+        "
         SELECT id, title, artist, genre, play_count
         FROM songs
         WHERE id = ?
-    "
+    ",
     )
     .bind(id as i32)
     .fetch_one(db) // Fetch the single row
